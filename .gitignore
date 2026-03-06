@@ -1,0 +1,10 @@
+# Go
+/route-collect-go
+*.test
+*.out
+
+# Emacs
+*~
+
+# macOS
+.DS_Store
