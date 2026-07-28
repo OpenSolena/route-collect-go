@@ -42,6 +42,15 @@ var (
 	// フルルートを持つルータでは初期同期が巨大になるため既定で有効。
 	updatesOnly = flag.Bool("updates-only", true, "初期同期を省略し，以降の更新のみ受信する")
 	mode        = flag.String("mode", "onchange", "サブスクリプションモード: onchange | sample")
+	// gNMI の既定は JSON だが，Junos の AFT センサーは JSON を扱えず
+	// 「json encoding not supported for sensor」を返す。既定を proto にする。
+	encoding = flag.String("encoding", "proto", "エンコーディング: proto | json | json_ietf | ascii | bytes")
+
+	// AFT パス (/network-instances/network-instance/afts) は Junos 26.2R1.7 の
+	// vJunos で "Unsupported subscription path" となるため既定から外した。
+	pathList = flag.String("paths",
+		"/network-instances/network-instance/protocols/protocol/bgp/rib",
+		"購読するパス（カンマ区切り）")
 	// sample モードは毎インターバルで全状態を送るため，updates-only は初回しか効かない。
 	sampleInterval = flag.Duration("sample-interval", 20*time.Second, "sample モード時の送信間隔")
 	heartbeat      = flag.Duration("heartbeat", 0, "onchange モード時のハートビート間隔（0 で無効）")
@@ -186,9 +195,21 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
-	paths := []string{
-		"/network-instances/network-instance/afts",
-		"/network-instances/network-instance/protocols/protocol/bgp",
+	enc, err := encodingValue(*encoding)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	// パスをひとつでも Junos が拒否するとストリーム全体が落ちるため，
+	// 切り分け時は -paths で 1 本だけ購読できるようにしておく。
+	var paths []string
+	for _, p := range strings.Split(*pathList, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) == 0 {
+		log.Fatalf("-paths が空です")
 	}
 
 	var subs []*gnmipb.Subscription
@@ -210,6 +231,7 @@ func main() {
 		Request: &gnmipb.SubscribeRequest_Subscribe{
 			Subscribe: &gnmipb.SubscriptionList{
 				Mode:         gnmipb.SubscriptionList_STREAM,
+				Encoding:     enc,
 				UpdatesOnly:  *updatesOnly,
 				Subscription: subs,
 			},
@@ -221,9 +243,9 @@ func main() {
 	}
 
 	if *updatesOnly {
-		log.Printf("Subscribe 開始（mode=%s, 初期同期なし）。sync_response を待機中...", *mode)
+		log.Printf("Subscribe 開始（mode=%s, encoding=%s, 初期同期なし）。sync_response を待機中...", *mode, *encoding)
 	} else {
-		log.Printf("Subscribe 開始（mode=%s, 初期同期あり）。更新を待機中...", *mode)
+		log.Printf("Subscribe 開始（mode=%s, encoding=%s, 初期同期あり）。更新を待機中...", *mode, *encoding)
 	}
 
 	synced := false
@@ -245,6 +267,24 @@ func main() {
 			continue
 		}
 		fmt.Printf("%v\n", resp)
+	}
+}
+
+// encodingValue はフラグ文字列を gNMI のエンコーディングに変換する。
+func encodingValue(s string) (gnmipb.Encoding, error) {
+	switch s {
+	case "proto":
+		return gnmipb.Encoding_PROTO, nil
+	case "json":
+		return gnmipb.Encoding_JSON, nil
+	case "json_ietf":
+		return gnmipb.Encoding_JSON_IETF, nil
+	case "ascii":
+		return gnmipb.Encoding_ASCII, nil
+	case "bytes":
+		return gnmipb.Encoding_BYTES, nil
+	default:
+		return 0, fmt.Errorf("未知のエンコーディング %q (proto | json | json_ietf | ascii | bytes)", s)
 	}
 }
 
