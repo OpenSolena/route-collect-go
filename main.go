@@ -73,6 +73,7 @@ var defaultProbePaths = []string{
 	"/interfaces/interface/state/counters",
 	"/network-instances/network-instance/afts",
 	"/network-instances/network-instance/afts/ipv4-unicast",
+	"/network-instances/network-instance/afts/ipv6-unicast",
 	"/network-instances/network-instance/protocols/protocol/bgp",
 	"/network-instances/network-instance/protocols/protocol/bgp/rib",
 	"/network-instances/network-instance/protocols/protocol/bgp/neighbors",
