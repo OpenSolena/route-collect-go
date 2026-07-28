@@ -8,3 +8,7 @@
 
 # macOS
 .DS_Store
+
+# コンテキスト記録はローカル管理（内部情報を含むため公開しない）
+CLAUDE.md
+CONTEXT.md
