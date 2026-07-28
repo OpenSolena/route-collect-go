@@ -2,22 +2,41 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"strings"
 	"time"
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
+// passwordEnv はパスワードの推奨受け渡し方法。コマンドライン引数は ps で
+// 他ユーザから見えてしまうため，環境変数かファイルを優先する。
+const passwordEnv = "GNMI_PASSWORD"
+
 var (
 	target   = flag.String("target", "localhost:32767", "gNMI ターゲット (host:port)")
 	username = flag.String("username", "", "認証ユーザー名")
-	password = flag.String("password", "", "認証パスワード")
+	password = flag.String("password", "", "認証パスワード（非推奨: ps で露出する。"+passwordEnv+" かファイルを使うこと）")
+
+	passwordFile = flag.String("password-file", "", "認証パスワードを読み込むファイル")
+
+	// TLS 関連。既定で TLS を要求し，パスワードが平文で流れないようにする。
+	useTLS     = flag.Bool("tls", true, "TLS を使用する（false にすると認証情報が平文で流れる）")
+	caFile     = flag.String("ca", "", "サーバ証明書を検証する CA 証明書 (PEM)。省略時はシステムの信頼ストア")
+	certFile   = flag.String("cert", "", "クライアント証明書 (PEM)。mutual TLS 用")
+	keyFile    = flag.String("key", "", "クライアント秘密鍵 (PEM)。mutual TLS 用")
+	serverName = flag.String("server-name", "", "証明書検証に使うサーバ名（省略時は -target のホスト名）")
+	skipVerify = flag.Bool("tls-skip-verify", false, "サーバ証明書を検証しない（ラボ専用・中間者攻撃に対して無防備）")
 
 	// updatesOnly は初期同期（現在の全状態のダンプ）を抑止する。
 	// フルルートを持つルータでは初期同期が巨大になるため既定で有効。
@@ -29,26 +48,133 @@ var (
 )
 
 // Junos の gNMI デフォルトポートは 32767
-// 本番では TLS を使うこと（insecure.NewCredentials() を置き換える）
+
+// userPassCreds は username/password を gRPC の per-RPC 認証情報として運ぶ。
+// RequireTransportSecurity が true なので，TLS でない接続に対して gRPC 自身が
+// 送信を拒否する。metadata に直接載せる方式と違い，平文送信を取り違えようがない。
+type userPassCreds struct {
+	username string
+	password string
+}
+
+func (c userPassCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{
+		"username": c.username,
+		"password": c.password,
+	}, nil
+}
+
+func (c userPassCreds) RequireTransportSecurity() bool { return true }
+
+// resolvePassword はパスワードを環境変数・ファイル・フラグの順に解決する。
+// フラグは ps から見えるため，使われた場合は警告する。
+func resolvePassword() (string, error) {
+	if v := os.Getenv(passwordEnv); v != "" {
+		return v, nil
+	}
+	if *passwordFile != "" {
+		b, err := os.ReadFile(*passwordFile)
+		if err != nil {
+			return "", fmt.Errorf("パスワードファイル読み込み失敗: %w", err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}
+	if *password != "" {
+		log.Printf("警告: -password は ps で他ユーザから見えます。%s 環境変数か -password-file を使ってください", passwordEnv)
+		return *password, nil
+	}
+	return "", nil
+}
+
+// buildTLSConfig は各フラグから TLS 設定を組み立てる。
+func buildTLSConfig() (*tls.Config, error) {
+	cfg := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: *skipVerify,
+	}
+
+	switch {
+	case *serverName != "":
+		cfg.ServerName = *serverName
+	default:
+		host, _, err := net.SplitHostPort(*target)
+		if err != nil {
+			return nil, fmt.Errorf("-target のホスト名を取得できません: %w", err)
+		}
+		cfg.ServerName = host
+	}
+
+	if *caFile != "" {
+		pem, err := os.ReadFile(*caFile)
+		if err != nil {
+			return nil, fmt.Errorf("CA 証明書読み込み失敗: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("CA 証明書 %s に有効な PEM が含まれていません", *caFile)
+		}
+		cfg.RootCAs = pool
+	}
+
+	// mutual TLS。Junos 側で mutual-authentication を設定した場合に使う。
+	if (*certFile == "") != (*keyFile == "") {
+		return nil, fmt.Errorf("-cert と -key は両方指定してください")
+	}
+	if *certFile != "" {
+		pair, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("クライアント証明書読み込み失敗: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+
+	return cfg, nil
+}
 
 func main() {
 	flag.Parse()
 
-	conn, err := grpc.NewClient(
-		*target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	pass, err := resolvePassword()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	opts := []grpc.DialOption{}
+	ctx := context.Background()
+
+	if *useTLS {
+		tlsCfg, err := buildTLSConfig()
+		if err != nil {
+			log.Fatalf("TLS 設定に失敗: %v", err)
+		}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+
+		// TLS 上でのみ per-RPC 認証情報を渡す。平文接続なら gRPC 側が送信を拒否する。
+		if *username != "" {
+			opts = append(opts, grpc.WithPerRPCCredentials(userPassCreds{
+				username: *username,
+				password: pass,
+			}))
+		}
+		if *skipVerify {
+			log.Printf("警告: -tls-skip-verify によりサーバ証明書を検証しません。ラボ以外では使わないでください")
+		}
+	} else {
+		// 平文フォールバック。認証情報がネットワーク上を平文で流れる。
+		log.Printf("警告: -tls=false です。認証情報が平文で流れます。ラボ以外では使わないでください")
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if *username != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, "username", *username, "password", pass)
+		}
+	}
+
+	conn, err := grpc.NewClient(*target, opts...)
 	if err != nil {
 		log.Fatalf("接続失敗: %v", err)
 	}
 	defer conn.Close()
 
 	client := gnmipb.NewGNMIClient(conn)
-
-	ctx := metadata.AppendToOutgoingContext(context.Background(),
-		"username", *username,
-		"password", *password,
-	)
 
 	stream, err := client.Subscribe(ctx)
 	if err != nil {

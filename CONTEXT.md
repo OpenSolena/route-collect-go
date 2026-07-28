@@ -37,6 +37,25 @@ Junos ルータから，routing-instance ごとの経路情報を収集する **
 routing-instance が多数になることが考えられるので，collector から router へ大量のリクエストを投げるのは router 側の負荷・接続数の観点から現実的でないと判断した。
 JTI（push 型）であれば，router 側が変化を送信するので collector は gRPC ストリームを数本張って待ち受けるだけで済む。
 
+### 認証情報を平文で流さない
+
+初期実装は `insecure.NewCredentials()` で TLS なし，かつ username/password を
+`metadata.AppendToOutgoingContext` で直接載せていたため，認証情報がネットワーク上を
+平文で流れていた。さらに `-password` フラグはコマンドライン引数なので `ps` から
+他ユーザに見えてしまう。
+
+対処として:
+
+- TLS を既定（`-tls`，既定 true）にし，`credentials.NewTLS` を使う
+- 認証情報は `grpc.WithPerRPCCredentials` で渡す。`RequireTransportSecurity()` が
+  true なので，平文接続では gRPC 自身が送信を拒否する。metadata に直接載せる方式と
+  違い，設定ミスで平文送信になることがない
+- パスワードは `GNMI_PASSWORD` 環境変数 → `-password-file` → `-password` の順に解決し，
+  フラグが使われた場合は警告する
+
+ラボで Junos を `clear-text` のまま使う場合は `-tls=false` で従来動作に戻せるが，
+警告を出す。
+
 ### ポーリング vs ストリーミング
 
 20 秒オーダーの同期が必要だが，routing-instance が多くなるとポーリングが破綻するためストリーミング（JTI, push 型）を採用。
