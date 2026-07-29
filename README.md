@@ -1,6 +1,12 @@
-# route-collect-go
+# route-collct-go
 
-Junos ルータから **gNMI / JTI（Juniper Telemetry Interface）**で経路情報を購読し，
+## WARNING: Work in Progress
+
+このソフトウェアはまだ WIP（開発中）です。
+
+## 概要
+
+Junos ルータから **gNMI / JTI（Juniper Telemetry Interface）** で経路情報を購読し，
 受信した内容を標準出力に流す collector です。
 
 routing-instance が数百規模になると，collector からルータへ問い合わせを繰り返す
@@ -57,6 +63,8 @@ route-collect-go \
   -ca ca.pem
 ```
 
+ラボでの試験などで TLS サーバ証明書の検証をしないで進めたい場合 `-tls-skip-verify` オプションで検証をスキップできます。
+
 `sync_response` を受け取ったあと，更新分が標準出力に流れます。
 
 証明書の SAN に入っている名前と接続先が違う場合（DNS 未登録で IP 接続するときなど）は
@@ -109,7 +117,7 @@ OK           /network-instances/network-instance/protocols/protocol/bgp/rib
 |---|---|---|
 | `-target` | `localhost:32767` | gNMI ターゲット（`host:port`）。Junos の既定ポートは 32767 |
 | `-username` | （なし） | 認証ユーザー名 |
-| `-password` | （なし） | 認証パスワード。**非推奨**（`ps` で他ユーザから見える）。使うと警告が出る |
+| `-password` | （なし） | 認証パスワード。**非推奨**（`ps` で他ユーザから見える）。使うと警告が出る。環境変数 `GNMI_PASSWORD` での指定をお勧めします |
 | `-password-file` | （なし） | パスワードを読み込むファイル。末尾の改行は落とす |
 
 パスワードは `GNMI_PASSWORD` 環境変数 → `-password-file` → `-password` の順に解決します。
