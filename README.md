@@ -22,7 +22,7 @@ routing-instance ごとのパースや FIB の取り込みは今後の課題で�
 ### 現状の制限
 
 - **FIB（AFT）は取得できません。** `/network-instances/network-instance/afts` は
-  少なくとも vJunos-router では `Unsupported subscription path` になります。
+  少なくとも vJunos-router 26.2R1.7 では `Unsupported subscription path` になります。
   実 PFE を持たない環境の制限と思われますが，`-probe` で各自のルータを確認してください。
   そのため既定の購読パスは BGP RIB のみです。
 - 出力は `SubscribeResponse` の文字列表現そのままです。構造化出力はまだありません。
