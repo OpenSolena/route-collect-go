@@ -9,7 +9,9 @@ routing-instance が数百規模になると，collector からルータへ問�
 待ち受けるだけで全 routing-instance の変化を受け取れるようにしています。
 
 現時点では受信した gNMI の `SubscribeResponse` をそのまま出力します。
-routing-instance ごとのパースや FIB の取り込みは今後の課題です。
+ただし `-updates-only=false` 時の初期同期分は進行状況として標準エラーに出力し，
+標準出力には `sync_response` 後の更新分だけを出力します。routing-instance ごとの
+パースや FIB の取り込みは今後の課題です。
 
 ## できること
 
@@ -27,8 +29,12 @@ routing-instance ごとのパースや FIB の取り込みは今後の課題で�
   そのため既定の購読パスは BGP RIB のみです。
 - 出力は `SubscribeResponse` の文字列表現そのままです。構造化出力はまだありません。
 - `extension.registered_ext`（JTI のシーケンス番号・タイムスタンプ）はパースしていません。
+- キー付きパス（例: `interface[name=xe-0/0/0]`）は未対応です。`-paths` にはキーを
+  指定しないサブツリーのパスを使ってください。
 
 ## インストール
+
+Go 1.26.1 以降が必要です。
 
 ```
 go install github.com/OpenSolena/route-collect-go@latest
@@ -160,6 +166,9 @@ TLS 有効時，認証情報は `grpc.WithPerRPCCredentials` で渡します。
 
 ## Junos 側の設定
 
+以下の設定例と動作上の注意は，vJunos-router 26.2R1.7 で確認したものです。
+実機や他の Junos リリースでは挙動・必要な権限が異なる可能性があります。
+
 gRPC の request-response サービスを SSL 付きで有効にします。
 
 ```
@@ -205,7 +214,7 @@ set system login user telemetry authentication plain-text-password
 set protocols bgp group <group> neighbor <neighbor> keep all
 ```
 
-### 既知の制約: 管理インスタンス（`mgmt_junos`）経由では接続できない
+### 確認済みの制約: 管理インスタンス（`mgmt_junos`）経由では接続できない
 
 fxp0 を `system management-instance` で `mgmt_junos` に入れていると，gRPC に接続できません。
 gRPC デーモンは default instance で動作するため，ワイルドカードで listen していても
