@@ -287,3 +287,10 @@ BGP RIB 配下は以下 12 パスすべてが購読できました。AFT と違�
 - JTI ヘッダ（`extension.registered_ext`）のパース
 - FIB の取得手段の検討（gNMI では取れないため別経路が要る）
 - routing-instance が多数ある場合のスループット確認
+
+## ライセンス
+
+BSD 2-Clause License です。全文は [LICENSE](LICENSE) を参照してください。
+
+Copyright (c) 2026 Taisuke "paina" SATO
+Copyright (c) 2026 OpenSolena Project
