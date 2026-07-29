@@ -57,6 +57,7 @@ var (
 	// sample モードは毎インターバルで全状態を送るため，updates-only は初回しか効かない。
 	sampleInterval = flag.Duration("sample-interval", 20*time.Second, "sample モード時の送信間隔")
 	heartbeat      = flag.Duration("heartbeat", 0, "onchange モード時のハートビート間隔（0 で無効）")
+	rpcTimeout     = flag.Duration("rpc-timeout", 10*time.Second, "接続と単発 RPC のタイムアウト")
 
 	// 調査用モード。ターゲットが何をサポートしているかを調べて終了する。
 	doCapabilities = flag.Bool("capabilities", false, "Capabilities RPC で対応モデル・エンコーディングを表示して終了する")
@@ -167,6 +168,9 @@ func buildTLSConfig() (*tls.Config, error) {
 
 func main() {
 	flag.Parse()
+	if *rpcTimeout <= 0 {
+		log.Fatalf("-rpc-timeout は 0 より大きくしてください")
+	}
 
 	pass, err := resolvePassword()
 	if err != nil {
@@ -202,13 +206,29 @@ func main() {
 		}
 	}
 
-	conn, err := grpc.NewClient(*target, opts...)
+	// grpc.NewClient は接続を待たずに返るため，到達不能なターゲットでは最初の
+	// RPC が無期限に待ち続ける。接続時だけは期限付きで待機し，確立後の
+	// Subscribe ストリームには期限を設けない。
+	dialCtx, cancelDial := context.WithTimeout(ctx, *rpcTimeout)
+	defer cancelDial()
+	opts = append(opts, grpc.WithBlock())
+	conn, err := grpc.DialContext(dialCtx, *target, opts...)
 	if err != nil {
 		log.Fatalf("接続失敗: %v", err)
 	}
 	defer conn.Close()
 
 	client := gnmipb.NewGNMIClient(conn)
+
+	// 調査モードは結果を出して終了する。
+	if *doCapabilities {
+		rpcCtx, cancel := context.WithTimeout(ctx, *rpcTimeout)
+		defer cancel()
+		if err := runCapabilities(rpcCtx, client); err != nil {
+			log.Fatalf("Capabilities 失敗: %v", err)
+		}
+		return
+	}
 
 	subMode, err := subscriptionMode(*mode)
 	if err != nil {
@@ -219,13 +239,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-
-	// 調査モードは結果を出して終了する。
-	if *doCapabilities {
-		if err := runCapabilities(ctx, client); err != nil {
-			log.Fatalf("Capabilities 失敗: %v", err)
-		}
-		return
+	if err := validateSubscriptionDurations(); err != nil {
+		log.Fatalf("%v", err)
 	}
 	if *doProbe {
 		runProbe(ctx, client, splitPaths(*probePathList), subMode, enc)
@@ -246,8 +261,12 @@ func main() {
 
 	var subs []*gnmipb.Subscription
 	for _, p := range paths {
+		path, err := ocPath(p)
+		if err != nil {
+			log.Fatalf("-paths のパスが不正です: %v", err)
+		}
 		s := &gnmipb.Subscription{
-			Path: ocPath(p),
+			Path: path,
 			Mode: subMode,
 		}
 		switch subMode {
@@ -394,7 +413,11 @@ func probeOne(ctx context.Context, client gnmipb.GNMIClient, path string,
 		return probeResult{path: path, status: "ERROR", detail: err.Error()}
 	}
 
-	sub := &gnmipb.Subscription{Path: ocPath(path), Mode: subMode}
+	gnmiPath, err := ocPath(path)
+	if err != nil {
+		return probeResult{path: path, status: "ERROR", detail: fmt.Sprintf("不正なパス: %v", err)}
+	}
+	sub := &gnmipb.Subscription{Path: gnmiPath, Mode: subMode}
 	switch subMode {
 	case gnmipb.SubscriptionMode_SAMPLE:
 		sub.SampleInterval = uint64(*sampleInterval)
@@ -478,13 +501,103 @@ func subscriptionMode(s string) (gnmipb.SubscriptionMode, error) {
 	}
 }
 
-// ocPath はスラッシュ区切りの OpenConfig パス文字列を gnmi.Path に変換する。
-func ocPath(s string) *gnmipb.Path {
+// validateSubscriptionDurations は gNMI の uint64 nanoseconds に変換する値を検証する。
+func validateSubscriptionDurations() error {
+	if *sampleInterval <= 0 {
+		return fmt.Errorf("-sample-interval は 0 より大きくしてください")
+	}
+	if *heartbeat < 0 {
+		return fmt.Errorf("-heartbeat は 0 以上にしてください")
+	}
+	if *probeTimeout <= 0 {
+		return fmt.Errorf("-probe-timeout は 0 より大きくしてください")
+	}
+	return nil
+}
+
+// ocPath は OpenConfig のパス文字列を gnmi.Path に変換する。リストキーは
+// element[key=value] の形で指定できる。キー値に含まれる / は角括弧内で扱う。
+func ocPath(s string) (*gnmipb.Path, error) {
 	var elems []*gnmipb.PathElem
-	for _, seg := range strings.Split(strings.TrimPrefix(s, "/"), "/") {
+	segments, err := splitPathSegments(s)
+	if err != nil {
+		return nil, err
+	}
+	for _, seg := range segments {
 		if seg != "" {
-			elems = append(elems, &gnmipb.PathElem{Name: seg})
+			elem, err := parsePathElem(seg)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, elem)
 		}
 	}
-	return &gnmipb.Path{Elem: elems}
+	if len(elems) == 0 {
+		return nil, fmt.Errorf("パスが空です")
+	}
+	return &gnmipb.Path{Elem: elems}, nil
+}
+
+func splitPathSegments(s string) ([]string, error) {
+	s = strings.TrimPrefix(s, "/")
+	var segments []string
+	start, depth := 0, 0
+	for i, r := range s {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth < 0 {
+				return nil, fmt.Errorf("閉じ角括弧の位置が不正です: %q", s)
+			}
+		case '/':
+			if depth == 0 {
+				segments = append(segments, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	if depth != 0 {
+		return nil, fmt.Errorf("角括弧が閉じていません: %q", s)
+	}
+	segments = append(segments, s[start:])
+	return segments, nil
+}
+
+func parsePathElem(segment string) (*gnmipb.PathElem, error) {
+	keyStart := strings.IndexByte(segment, '[')
+	name := segment
+	if keyStart >= 0 {
+		name = segment[:keyStart]
+	}
+	if name == "" {
+		return nil, fmt.Errorf("要素名がありません: %q", segment)
+	}
+	if keyStart < 0 {
+		return &gnmipb.PathElem{Name: name}, nil
+	}
+
+	elem := &gnmipb.PathElem{Name: name, Key: make(map[string]string)}
+	predicates := segment[keyStart:]
+	for predicates != "" {
+		if !strings.HasPrefix(predicates, "[") {
+			return nil, fmt.Errorf("キー指定の形式が不正です: %q", segment)
+		}
+		end := strings.IndexByte(predicates, ']')
+		if end < 0 {
+			return nil, fmt.Errorf("キー指定が閉じていません: %q", segment)
+		}
+		predicate := predicates[1:end]
+		key, value, ok := strings.Cut(predicate, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("キー指定は key=value 形式にしてください: %q", segment)
+		}
+		if _, duplicate := elem.Key[key]; duplicate {
+			return nil, fmt.Errorf("キー %q が重複しています: %q", key, segment)
+		}
+		elem.Key[key] = value
+		predicates = predicates[end+1:]
+	}
+	return elem, nil
 }
