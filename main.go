@@ -16,6 +16,7 @@ import (
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -166,6 +167,28 @@ func buildTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// waitForConnection は接続が確立するまで期限付きで待つ。
+//
+// 同じことを grpc.DialContext と grpc.WithBlock() でもできるが，どちらも
+// deprecated なので接続状態の遷移を自前で待つ。TRANSIENT_FAILURE でも
+// 期限まで再試行するのは WithBlock と同じ挙動。
+func waitForConnection(ctx context.Context, conn *grpc.ClientConn, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn.Connect()
+	for {
+		s := conn.GetState()
+		if s == connectivity.Ready {
+			return nil
+		}
+		// 状態が変わらないまま期限切れになると false が返る。
+		if !conn.WaitForStateChange(ctx, s) {
+			return fmt.Errorf("%s に %s 以内で接続できませんでした（接続状態 %s）", *target, timeout, s)
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *rpcTimeout <= 0 {
@@ -206,17 +229,19 @@ func main() {
 		}
 	}
 
-	// grpc.NewClient は接続を待たずに返るため，到達不能なターゲットでは最初の
-	// RPC が無期限に待ち続ける。接続時だけは期限付きで待機し，確立後の
-	// Subscribe ストリームには期限を設けない。
-	dialCtx, cancelDial := context.WithTimeout(ctx, *rpcTimeout)
-	defer cancelDial()
-	opts = append(opts, grpc.WithBlock())
-	conn, err := grpc.DialContext(dialCtx, *target, opts...)
+	conn, err := grpc.NewClient(*target, opts...)
 	if err != nil {
 		log.Fatalf("接続失敗: %v", err)
 	}
 	defer conn.Close()
+
+	// grpc.NewClient は接続を待たずに返る。到達不能なターゲット（mgmt_junos 経由で
+	// SYN が捨てられる場合など）では TCP のタイムアウトまで最初の RPC が待たされる
+	// ため，接続確立だけは期限付きで待つ。確立後の Subscribe ストリームには
+	// 期限を設けない。
+	if err := waitForConnection(ctx, conn, *rpcTimeout); err != nil {
+		log.Fatalf("接続失敗: %v", err)
+	}
 
 	client := gnmipb.NewGNMIClient(conn)
 
