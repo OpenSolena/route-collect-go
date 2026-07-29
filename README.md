@@ -1,4 +1,4 @@
-# route-collct-go
+# route-collect-go
 
 ## WARNING: Work in Progress
 
@@ -36,8 +36,6 @@ FIB の取り込みは今後の課題です。
   そのため既定の購読パスは BGP RIB のみです。
 - 出力は `SubscribeResponse` の文字列表現そのままです。構造化出力はまだありません。
 - `extension.registered_ext`（JTI のシーケンス番号・タイムスタンプ）はパースしていません。
-- キー付きパス（例: `interface[name=xe-0/0/0]`）は未対応です。`-paths` にはキーを
-  指定しないサブツリーのパスを使ってください。
 
 ## インストール
 
@@ -119,6 +117,7 @@ OK           /network-instances/network-instance/protocols/protocol/bgp/rib
 | `-username` | （なし） | 認証ユーザー名 |
 | `-password` | （なし） | 認証パスワード。**非推奨**（`ps` で他ユーザから見える）。使うと警告が出る。環境変数 `GNMI_PASSWORD` での指定をお勧めします |
 | `-password-file` | （なし） | パスワードを読み込むファイル。末尾の改行は落とす |
+| `-rpc-timeout` | `10s` | 接続確立と単発 RPC（`-capabilities`）のタイムアウト。Subscribe ストリームには期限を設けない |
 
 パスワードは `GNMI_PASSWORD` 環境変数 → `-password-file` → `-password` の順に解決します。
 環境変数かファイルを使ってください。
@@ -159,8 +158,16 @@ TLS 有効時，認証情報は `grpc.WithPerRPCCredentials` で渡します。
   効きません。
 - **パスをひとつでもルータが拒否するとストリーム全体が落ちます。** 切り分けるときは
   `-paths` に 1 本だけ指定してください。
-- パスにキーは不要です。`neighbors/neighbor` を `[neighbor-address=…]` なしで投げても
-  サブツリー購読として受理されます。
+- **既定のままだと何も出力されないことがあります。** `-updates-only=true` では
+  `sync_response` の後に実際に変化した分しか流れないため，テーブルが安定していると
+  長時間無音になります。購読できているか確かめたいときは `-updates-only=false` にして
+  初期同期を出させてください。初期同期分は標準エラーに出るので `2>&1` で拾います。
+- リストキーは `element[key=value]` の形で指定できます。`[` `]` の中であればキー値に
+  `/` を含められます（例: `interface[name=xe-0/0/0]`）。ひとつの要素に複数のキーを
+  並べることもできます。
+- **キーの指定は必須ではありません。** `neighbors/neighbor` を `[neighbor-address=…]`
+  なしで投げてもサブツリー購読として受理されます。キーを付けると対象を絞れますが，
+  Junos がキー付きパスを受理するかは未検証です。
 
 ### 調査
 
@@ -269,6 +276,10 @@ BGP RIB 配下は以下 12 パスすべてが購読できました。AFT と違�
 ```
 
 （`…` は `/network-instances/network-instance/protocols/protocol/bgp` です）
+
+ここで確認しているのは購読が受理されたことまでで，センサーが実際にデータを出すかは
+別の話です。`adj-rib-in-pre` については `keep all` を入れた状態で
+`-updates-only=false` にして，実際にデータが流れることまで確認しています。
 
 ## 今後の予定
 
