@@ -194,6 +194,9 @@ set system login user telemetry class read-only
 set system login user telemetry authentication plain-text-password
 ```
 
+動作確認はこれより広い権限のクラスで行っているため，`read-only` で購読できるかは
+未確認です。購読が権限エラーで弾かれる場合はクラスを見直してください。
+
 ### pre-policy の adj-rib-in を見る場合
 
 `adj-rib-in-pre` を購読するには，ネイバーごとに `keep all` が必要です。
