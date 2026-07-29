@@ -9,9 +9,10 @@ routing-instance が数百規模になると，collector からルータへ問�
 待ち受けるだけで全 routing-instance の変化を受け取れるようにしています。
 
 現時点では受信した gNMI の `SubscribeResponse` をそのまま出力します。
-ただし `-updates-only=false` 時の初期同期分は進行状況として標準エラーに出力し，
-標準出力には `sync_response` 後の更新分だけを出力します。routing-instance ごとの
-パースや FIB の取り込みは今後の課題です。
+標準出力に出るのは `sync_response` より後の更新分だけで，それより前に届いた初期同期分は
+標準エラーに出力します。要約ではなく受信内容をそのまま出すため，初期同期を有効にして
+フルルートを受けると標準エラーが大量になります。routing-instance ごとのパースや
+FIB の取り込みは今後の課題です。
 
 ## できること
 
@@ -166,8 +167,8 @@ TLS 有効時，認証情報は `grpc.WithPerRPCCredentials` で渡します。
 
 ## Junos 側の設定
 
-以下の設定例と動作上の注意は，vJunos-router 26.2R1.7 で確認したものです。
-実機や他の Junos リリースでは挙動・必要な権限が異なる可能性があります。
+この節を確認した環境は vJunos-router 26.2R1.7 です。実機や他の Junos リリースでは
+挙動・必要な権限が異なる可能性があります。各項目がどこまで検証済みかは個別に注記します。
 
 gRPC の request-response サービスを SSL 付きで有効にします。
 
@@ -190,7 +191,8 @@ request security pki local-certificate generate-self-signed certificate-id gnmi-
     subject "CN=router.example.net"
 ```
 
-生成した証明書を取り出して collector 側の `-ca` に渡します。
+オプションの細部は環境に合わせて調整してください。生成した証明書を取り出して
+collector 側の `-ca` に渡します。
 DNS に登録していないホスト名を SAN に入れた場合は，IP で接続しつつ `-server-name` で
 検証名を合わせてください。
 
@@ -214,7 +216,7 @@ set system login user telemetry authentication plain-text-password
 set protocols bgp group <group> neighbor <neighbor> keep all
 ```
 
-### 確認済みの制約: 管理インスタンス（`mgmt_junos`）経由では接続できない
+### 確認済みの制約（vJunos-router 26.2R1.7）: 管理インスタンス（`mgmt_junos`）経由では接続できない
 
 fxp0 を `system management-instance` で `mgmt_junos` に入れていると，gRPC に接続できません。
 gRPC デーモンは default instance で動作するため，ワイルドカードで listen していても
