@@ -9,14 +9,17 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // passwordEnv はパスワードの推奨受け渡し方法。コマンドライン引数は ps で
@@ -54,7 +57,29 @@ var (
 	// sample モードは毎インターバルで全状態を送るため，updates-only は初回しか効かない。
 	sampleInterval = flag.Duration("sample-interval", 20*time.Second, "sample モード時の送信間隔")
 	heartbeat      = flag.Duration("heartbeat", 0, "onchange モード時のハートビート間隔（0 で無効）")
+
+	// 調査用モード。ターゲットが何をサポートしているかを調べて終了する。
+	doCapabilities = flag.Bool("capabilities", false, "Capabilities RPC で対応モデル・エンコーディングを表示して終了する")
+	doProbe        = flag.Bool("probe", false, "候補パスを 1 本ずつ購読して可否を判定し，結果を表示して終了する")
+	probePathList  = flag.String("probe-paths", strings.Join(defaultProbePaths, ","),
+		"-probe で試すパス（カンマ区切り）")
+	probeTimeout = flag.Duration("probe-timeout", 5*time.Second, "-probe で 1 パスあたり応答を待つ時間")
 )
+
+// defaultProbePaths は -probe の既定の候補パス。
+// Junos は「モデルは宣言されているがテレメトリのセンサーが無い」ことがあるため，
+// Capabilities の結果だけでは購読可否が判断できない。実際に張って確かめる。
+var defaultProbePaths = []string{
+	"/interfaces/interface/state/counters",
+	"/network-instances/network-instance/afts",
+	"/network-instances/network-instance/afts/ipv4-unicast",
+	"/network-instances/network-instance/afts/ipv6-unicast",
+	"/network-instances/network-instance/protocols/protocol/bgp",
+	"/network-instances/network-instance/protocols/protocol/bgp/rib",
+	"/network-instances/network-instance/protocols/protocol/bgp/neighbors",
+	"/network-instances/network-instance/tables",
+	"/routing-options",
+}
 
 // Junos の gNMI デフォルトポートは 32767
 
@@ -185,11 +210,6 @@ func main() {
 
 	client := gnmipb.NewGNMIClient(conn)
 
-	stream, err := client.Subscribe(ctx)
-	if err != nil {
-		log.Fatalf("Subscribe 失敗: %v", err)
-	}
-
 	subMode, err := subscriptionMode(*mode)
 	if err != nil {
 		log.Fatalf("%v", err)
@@ -200,16 +220,28 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
+	// 調査モードは結果を出して終了する。
+	if *doCapabilities {
+		if err := runCapabilities(ctx, client); err != nil {
+			log.Fatalf("Capabilities 失敗: %v", err)
+		}
+		return
+	}
+	if *doProbe {
+		runProbe(ctx, client, splitPaths(*probePathList), subMode, enc)
+		return
+	}
+
 	// パスをひとつでも Junos が拒否するとストリーム全体が落ちるため，
 	// 切り分け時は -paths で 1 本だけ購読できるようにしておく。
-	var paths []string
-	for _, p := range strings.Split(*pathList, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			paths = append(paths, p)
-		}
-	}
+	paths := splitPaths(*pathList)
 	if len(paths) == 0 {
 		log.Fatalf("-paths が空です")
+	}
+
+	stream, err := client.Subscribe(ctx)
+	if err != nil {
+		log.Fatalf("Subscribe 失敗: %v", err)
 	}
 
 	var subs []*gnmipb.Subscription
@@ -267,6 +299,152 @@ func main() {
 			continue
 		}
 		fmt.Printf("%v\n", resp)
+	}
+}
+
+// splitPaths はカンマ区切りのパス指定を分解する。
+func splitPaths(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// runCapabilities は Capabilities RPC を呼び，対応モデルとエンコーディングを表示する。
+// 出力はバージョン間で diff できるよう名前順に並べる。
+func runCapabilities(ctx context.Context, client gnmipb.GNMIClient) error {
+	resp, err := client.Capabilities(ctx, &gnmipb.CapabilityRequest{})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("gNMI-version: %s\n", resp.GetGNMIVersion())
+
+	encs := make([]string, 0, len(resp.GetSupportedEncodings()))
+	for _, e := range resp.GetSupportedEncodings() {
+		encs = append(encs, e.String())
+	}
+	sort.Strings(encs)
+	fmt.Printf("encodings: %s\n", strings.Join(encs, ", "))
+
+	models := resp.GetSupportedModels()
+	fmt.Printf("models: %d\n", len(models))
+
+	lines := make([]string, 0, len(models))
+	for _, m := range models {
+		lines = append(lines, fmt.Sprintf("%s\t%s\t%s", m.GetName(), m.GetOrganization(), m.GetVersion()))
+	}
+	sort.Strings(lines)
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	return nil
+}
+
+// probeResult は 1 パスの購読可否。
+type probeResult struct {
+	path   string
+	status string
+	detail string
+}
+
+// runProbe は候補パスを 1 本ずつ購読して可否を判定する。
+//
+// Junos は Capabilities でモデルを宣言していても，そのパスのテレメトリ用センサーが
+// 実装されていないことがある（例: 実 PFE を持たない vJunos の AFT）。
+// モデル宣言では分からないので，実際に Subscribe して応答で判断する。
+func runProbe(ctx context.Context, client gnmipb.GNMIClient, paths []string,
+	subMode gnmipb.SubscriptionMode, enc gnmipb.Encoding) {
+
+	if len(paths) == 0 {
+		log.Fatalf("-probe-paths が空です")
+	}
+
+	log.Printf("プローブ開始: %d パス (encoding=%s, mode=%s, timeout=%s/パス)",
+		len(paths), *encoding, *mode, *probeTimeout)
+
+	results := make([]probeResult, 0, len(paths))
+	for _, p := range paths {
+		results = append(results, probeOne(ctx, client, p, subMode, enc))
+	}
+
+	fmt.Printf("\n%-12s %s\n", "STATUS", "PATH")
+	for _, r := range results {
+		fmt.Printf("%-12s %s\n", r.status, r.path)
+		if r.detail != "" {
+			fmt.Printf("%-12s   %s\n", "", r.detail)
+		}
+	}
+}
+
+// probeOne は 1 パスだけを購読し，sync_response が返れば購読可能と判定する。
+func probeOne(ctx context.Context, client gnmipb.GNMIClient, path string,
+	subMode gnmipb.SubscriptionMode, enc gnmipb.Encoding) probeResult {
+
+	// フルルートを持つルータで初期同期を受けると膨大になるため，
+	// プローブでは -updates-only の指定によらず必ず初期同期を省略する。
+	pctx, cancel := context.WithTimeout(ctx, *probeTimeout)
+	defer cancel()
+
+	stream, err := client.Subscribe(pctx)
+	if err != nil {
+		return probeResult{path: path, status: "ERROR", detail: err.Error()}
+	}
+
+	sub := &gnmipb.Subscription{Path: ocPath(path), Mode: subMode}
+	switch subMode {
+	case gnmipb.SubscriptionMode_SAMPLE:
+		sub.SampleInterval = uint64(*sampleInterval)
+	case gnmipb.SubscriptionMode_ON_CHANGE:
+		sub.HeartbeatInterval = uint64(*heartbeat)
+	}
+
+	req := &gnmipb.SubscribeRequest{
+		Request: &gnmipb.SubscribeRequest_Subscribe{
+			Subscribe: &gnmipb.SubscriptionList{
+				Mode:         gnmipb.SubscriptionList_STREAM,
+				Encoding:     enc,
+				UpdatesOnly:  true,
+				Subscription: []*gnmipb.Subscription{sub},
+			},
+		},
+	}
+	if err := stream.Send(req); err != nil {
+		return probeResult{path: path, status: "ERROR", detail: err.Error()}
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			return classifyProbeError(path, err)
+		}
+		// sync_response が返れば，その時点で購読は受理されている。
+		if resp.GetSyncResponse() {
+			return probeResult{path: path, status: "OK"}
+		}
+		// updates_only を無視して初期同期を送ってくる実装もある。
+		// データが届いた時点で購読可能と判断してよい。
+		return probeResult{path: path, status: "OK", detail: "初期同期あり（updates_only が無視された）"}
+	}
+}
+
+// classifyProbeError はストリームのエラーを判定結果に変換する。
+func classifyProbeError(path string, err error) probeResult {
+	st, ok := status.FromError(err)
+	if !ok {
+		return probeResult{path: path, status: "ERROR", detail: err.Error()}
+	}
+	switch st.Code() {
+	case codes.InvalidArgument:
+		return probeResult{path: path, status: "UNSUPPORTED", detail: st.Message()}
+	case codes.DeadlineExceeded:
+		// 受理されたが更新が無いまま時間切れ，という可能性もある。
+		return probeResult{path: path, status: "TIMEOUT", detail: "応答なし（sync_response が返らない）"}
+	default:
+		return probeResult{path: path, status: "ERROR", detail: fmt.Sprintf("%s: %s", st.Code(), st.Message())}
 	}
 }
 
